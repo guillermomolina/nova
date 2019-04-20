@@ -69,6 +69,7 @@ from nova.i18n import _
 from nova.image import API as glance_api
 from nova.image import glance
 from nova.network.neutronv2 import api as neutronv2_api
+from nova.network import model as network_model
 from nova import objects
 from nova.objects import flavor as flavor_obj
 from nova.objects import migrate_data as migrate_data_obj
@@ -800,6 +801,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
     def instance_exists(self, instance):
         LOG.debug("instance_exists")
+        return instance.name in self.list_instances()
         """Checks existence of an instance on the host.
 
         :param instance: The instance to lookup
@@ -814,10 +816,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
             encouraged to override this method with something more
             efficient.
         """
-        try:
-            return instance.uuid in self.list_instance_uuids()
-        except NotImplementedError:
-            return instance.name in self.list_instances()
+#        try:
+#            return instance.uuid in self.list_instance_uuids()
+#        except NotImplementedError:
+#            return instance.name in self.list_instances()
 
     def estimate_instance_overhead(self, instance_info):
         LOG.debug("estimate_instance_overhead")
@@ -845,6 +847,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         instances_list = []
         for zone in self._get_list_zone_object():
             instances_list.append(self.rad_connection.get_object(zone).name)
+        LOG.debug("instance list %s", instances_list)
         return instances_list
 
     def list_instance_uuids(self):
@@ -852,7 +855,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """Return the UUIDS of all the instances known to the virtualization
         layer, as a list.
         """
-        raise NotImplementedError()
+        return self.list_instances()
 
     def _rebuild_block_devices(self, context, instance, bdms, recreate):
         root_ci = None
@@ -1513,7 +1516,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 raise nova.exception.NovaException(msg)
 
     def _plug_vifs(self, instance, network_info):
-        LOG.debug("OVS used")
+        LOG.debug("_plug_vifs instance: %s, network info: %s", instance, network_info)
         return
         if not network_info:
             LOG.debug(_("Instance has no VIF. Nothing to plug."))
@@ -1553,7 +1556,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             self._ovs_add_port(instance, vif, anet)
 
     def _unplug_vifs(self, instance):
-        LOG.debug("OVS used")
+        LOG.debug("_unplug_vifs instance: %s", instance)
         return
         ovs_bridge = CONF.neutron.ovs_bridge
         # remove the anets from the OVS bridge
@@ -1652,19 +1655,30 @@ class SolarisZonesDriver(driver.ComputeDriver):
         network_plugin = neutronv2_api.get_client(context, admin=True)
         network = network_plugin.show_network(
             vif['network']['id'])['network']
-        LOG.debug(network)
+        LOG.debug(network, vif)
         network_type = network['provider:network_type']
         lower_link = None
+        vlan_id = 0
         if network_type in ['vlan', 'flat']:
             physical_network = network['provider:physical_network']
-            # retrieve the other_config information from Open_vSwitch table
-            lower_link = 'net170'
+
+            vif_details = vif['details']
+            lower_link = vif_details.get(network_model.VIF_DETAILS_PHYS_INTERFACE)
             
             if not lower_link:
                 msg = (_("Failed to determine the lower_link for vif '%s'.") % 
                        (vif))
                 LOG.error(msg)
                 raise exception.NovaException(msg)
+              
+            if network_type == 'vlan':
+                vlan_id = vif_details.get(network_model.VIF_DETAILS_VLAN)
+                
+                if not vlan_id:
+                    msg = (_("Failed to determine the vlan_id for vif '%s'.") % 
+                          (vif))
+                    LOG.error(msg)
+                    raise exception.NovaException(msg)
         else:
             # TYPE_GRE and TYPE_LOCAL
             msg = (_("Unsupported network type: %s") % network_type)
@@ -1679,6 +1693,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 zc.setprop('anet', 'mac-address', vif['address'])
                 if mtu > 0:
                     zc.setprop('anet', 'mtu', str(mtu))
+                if vlan_id > 0:
+                    zc.setprop('anet', 'vlan-id', str(vlan_id))
             else:
                 props = [zonemgr.Property('lower-link', lower_link),
                          zonemgr.Property('configure-allowed-address',
@@ -1686,6 +1702,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
                          zonemgr.Property('mac-address', vif['address'])]
                 if mtu > 0:
                     props.append(zonemgr.Property('mtu', str(mtu)))
+                if vlan_id > 0:
+                    props.append(zonemgr.Property('vlan-id', str(vlan_id)))
                 zc.addresource('anet', props)
 
             prop_filter = [zonemgr.Property('mac-address', vif['address'])]
@@ -2405,6 +2423,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
     def _power_off(self, instance, halt_type):
         """Power off a Solaris Zone."""
         name = instance['name']
+        LOG.debug("powering off: %s", name)
         zone = self._get_zone_by_name(name)
         if zone is None:
             raise exception.InstanceNotFound(instance_id=name)
